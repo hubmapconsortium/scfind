@@ -12,3 +12,9 @@ h5py>=3.10.0
 gensim>=4.3.2
 fuzzywuzzy>=0.18.0
 rapidfuzz>=3.5.2
+boto3
+Flask
+flask-cors
+
+scanpy==1.9.5
+
