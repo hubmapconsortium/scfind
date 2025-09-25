@@ -22,26 +22,44 @@ from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from filelock import FileLock
 from logging.handlers import RotatingFileHandler
-
-# Optional: import scfind (must be available in the image)
-# import scfind
+import scfind
+from logging import Formatter, StreamHandler, getLogger
+try:
+    # Safe across gunicorn workers (processes/threads)
+    from concurrent_log_handler import ConcurrentRotatingFileHandler as SafeRotating
+except Exception:
+    # Fallback if the dependency isn't available (not process-safe)
+    from logging.handlers import RotatingFileHandler as SafeRotating
 
 app = Flask(__name__)
 
-log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-mem_handler = RotatingFileHandler("memory.log", maxBytes=2 * 1024 * 1024, backupCount=5)
+log_formatter = Formatter('%(asctime)s - %(levelname)s - %(message)s')
+access_line_formatter = Formatter('%(message)s')
+
+# File handlers (process-safe rotation)
+mem_handler = SafeRotating("memory.log", maxBytes=2 * 1024 * 1024, backupCount=5, delay=True)
 mem_handler.setFormatter(log_formatter)
 mem_handler.setLevel(logging.INFO)
-app.logger.addHandler(mem_handler)
+
+access_handler = SafeRotating("access.log", maxBytes=10 * 1024 * 1024, backupCount=10, delay=True)
+access_handler.setFormatter(access_line_formatter)
+access_handler.setLevel(logging.INFO)
+
+# Also mirror to stdout so `docker logs -f` shows everything
+stream_handler = StreamHandler()
+stream_handler.setFormatter(log_formatter)
+stream_handler.setLevel(logging.INFO)
+
+# app logger (memory + diagnostics)
+app.logger.handlers[:] = [mem_handler, stream_handler]
 app.logger.setLevel(logging.INFO)
 app.logger.propagate = False
 
-access_logger = logging.getLogger("access")
+# access logger (JSON lines you write in before/after/teardown)
+access_logger = getLogger("access")
+access_logger.handlers[:] = [access_handler, stream_handler]
 access_logger.setLevel(logging.INFO)
 access_logger.propagate = False
-access_handler = RotatingFileHandler("access.log", maxBytes=10 * 1024 * 1024, backupCount=10)
-access_handler.setFormatter(logging.Formatter('%(message)s'))
-access_logger.addHandler(access_handler)
 
 CORS(app, resources={r"/api/*": {"origins": [
     "http://localhost:5001",
@@ -55,33 +73,21 @@ CORS(app, resources={r"/api/*": {"origins": [
 ]}}, supports_credentials=True)
 
 S3_BUCKET_NAME = os.environ.get('SCFIND_S3_BUCKET', 'scfind-dataset')
-DATA_ROOT = os.environ.get('SCFIND_DATA_ROOT', '/data/scfind') 
+DATA_ROOT = os.environ.get('SCFIND_DATA_ROOT', '/data/scfind')
 CACHE_MAXSIZE = int(os.environ.get('SCFIND_CACHE_MAXSIZE', '2'))
-CACHE_TTL = int(os.environ.get('SCFIND_CACHE_TTL_SECONDS', '36000'))  
+CACHE_TTL = int(os.environ.get('SCFIND_CACHE_TTL_SECONDS', '36000'))  # 0 => no TTL
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
-if CACHE_TTL > 0:
-    scfind_cache: TTLCache[str, "IndexHolder"] = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL)
-else:
-    scfind_cache: Dict[str, "IndexHolder"] = {}
-
-scfind_cache_lock = Lock()            
-loading_locks: Dict[str, Lock] = defaultdict(Lock) 
-active_uses: Dict[str, int] = defaultdict(int)
-
+# metadata keyed by friendly index_version
 cache_meta: Dict[str, Dict[str, Any]] = {}
 
-_SENSITIVE_KEYS = {"authorization", "api_key", "x-api-key", "password", "secret", "token"}
-
-
+# cache: index_version -> IndexHolder
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def rss_mb() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1e6
-
 
 def malloc_trim() -> None:
     try:
@@ -89,9 +95,98 @@ def malloc_trim() -> None:
     except Exception:
         pass
 
+# Dispose helper for evictions
+def _dispose(holder: Optional["IndexHolder"]) -> None:
+    if not holder:
+        return
+    try:
+        holder.close()
+    except Exception:
+        pass
+    # Drop strong refs
+    del holder
+    gc.collect()
+    malloc_trim()
+
+def _on_cache_evict(key, holder):
+    """Called by TTLCache on TTL/LRU eviction."""
+    try:
+        before = rss_mb()
+        _dispose(holder)
+        after = rss_mb()
+        app.logger.info(
+            f"[CacheEvict] key={key} rss_before={before:.2f}MB rss_after={after:.2f}MB delta={after-before:.2f}MB"
+        )
+    except Exception as e:
+        app.logger.warning(f"[CacheEvict] dispose failed for {key}: {e}")
+
+# -------- Disposal helpers --------
+def _dispose(holder: Optional["IndexHolder"]) -> None:
+    if not holder:
+        return
+    try:
+        holder.close()
+    except Exception:
+        pass
+    del holder
+    gc.collect()
+    malloc_trim()
+
+def _on_cache_evict(key, holder):
+    """Called whenever an entry is evicted or expired and removed."""
+    try:
+        before = rss_mb()
+        _dispose(holder)
+        after = rss_mb()
+        app.logger.info(
+            f"[CacheEvict] key={key} rss_before={before:.2f}MB rss_after={after:.2f}MB delta={after-before:.2f}MB"
+        )
+    except Exception as e:
+        app.logger.warning(f"[CacheEvict] dispose failed for {key}: {e}")
+
+# -------- TTLCache with disposal hook --------
+from cachetools import TTLCache
+
+class TTLCacheWithDispose(TTLCache):
+    def __delitem__(self, key):
+        try:
+            # If present and not already expired, fetch for disposal.
+            # Accessing via dict avoids triggering another expiry path.
+            val = self._Cache__data.get(key, None)  # type: ignore[attr-defined]
+            if val is not None:
+                _on_cache_evict(key, val)
+        except Exception:
+            # Best effort; never block deletion
+            pass
+        super().__delitem__(key)
+
+    def popitem(self):
+        # Called by internal eviction to remove one item; dispose it.
+        k, v = super().popitem()
+        try:
+            _on_cache_evict(k, v)
+        except Exception:
+            pass
+        return (k, v)
+
+
+# cache: index_version -> IndexHolder
+if CACHE_TTL > 0:
+    scfind_cache: TTLCacheWithDispose[str, "IndexHolder"] = TTLCacheWithDispose(
+        maxsize=CACHE_MAXSIZE,
+        ttl=CACHE_TTL,
+    )
+else:
+    scfind_cache: Dict[str, "IndexHolder"] = {}
+
+scfind_cache_lock = Lock()               # protects scfind_cache / cache_meta
+loading_locks: Dict[str, Lock] = defaultdict(Lock)  # per canonical_key
+active_uses: Dict[str, int] = defaultdict(int)
+
+_SENSITIVE_KEYS = {"authorization", "api_key", "x-api-key", "password", "secret", "token"}
+
 def _clip_str(s: str, limit=2000):
     return s if len(s) <= limit else s[:limit] + "...<clipped>"
-
 
 def safe_json(val, limit=2000):
     try:
@@ -105,12 +200,10 @@ def safe_json(val, limit=2000):
     except Exception:
         return "<unserializable>"
 
-
 def _mask_sensitive(d: dict):
     if not isinstance(d, dict):
         return d
     return {k: ("***" if str(k).lower() in _SENSITIVE_KEYS else v) for k, v in d.items()}
-
 
 @app.before_request
 def _access_log_request():
@@ -118,6 +211,8 @@ def _access_log_request():
     g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     g.request_timestamp = now_iso()
     g.endpoint_name = request.endpoint
+
+    # merged params
     args = request.args.to_dict(flat=False)
     args = {k: (v[0] if isinstance(v, list) and len(v) == 1 else v) for k, v in args.items()}
     body = request.get_json(silent=True)
@@ -210,7 +305,7 @@ def ensure_local_files(canonical_key: str, f1: Tuple[str, str], f2: Tuple[str, s
                 tmp = dst + ".part"
                 s3 = boto3.client('s3')
                 s3.download_file(S3_BUCKET_NAME, key, tmp, ExtraArgs={'VersionId': vid})
-                os.replace(tmp, dst)  
+                os.replace(tmp, dst)  # atomic
     return p1, p2
 
 class IndexHolder:
@@ -228,20 +323,7 @@ class IndexHolder:
                     obj.close()
                 except Exception:
                     pass
-
-
-def _dispose(holder: Optional[IndexHolder]) -> None:
-    if not holder:
-        return
-    try:
-        holder.close()
-    except Exception:
-        pass
-
-    del holder
-    gc.collect()
-    malloc_trim()
-
+                    
 def resolve_index_version() -> str:
     iv = request.args.get('index_version')
     if not iv:
@@ -252,7 +334,7 @@ def resolve_index_version() -> str:
         iv = s3_version_info(None)[0]
     g.resolved_index_version = iv
     return iv
-    
+
 @contextmanager
 def use_dataset(index_version: str):
     active_uses[index_version] += 1
@@ -263,19 +345,28 @@ def use_dataset(index_version: str):
 
 def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfind.SCFind]:
     index_version, canonical_key, f1, f2 = s3_version_info(index_version)
+
+    # fast path
     with scfind_cache_lock:
         holder = scfind_cache.get(index_version)
         if holder:
+            app.logger.info(f"[CacheHit] {index_version} (ckey={holder.canonical_key}) rss={rss_mb():.2f}MB")
             return holder.a, holder.b
 
+    app.logger.info(f"[CacheMiss] {index_version} (ckey={canonical_key}) entering load gate")
+
+    # serialize loads per canonical resource
     with loading_locks[canonical_key]:
         with scfind_cache_lock:
             holder = scfind_cache.get(index_version)
             if holder:
+                app.logger.info(f"[CacheHitAfterWait] {index_version} (ckey={holder.canonical_key}) rss={rss_mb():.2f}MB")
                 return holder.a, holder.b
-                
+
+        # ensure files exist on disk
         p1, p2 = ensure_local_files(canonical_key, f1, f2)
 
+        # load safely (so partial failures don't leak)
         load_uid = uuid.uuid4().hex
         rss_before = rss_mb()
         a = b = None
@@ -283,6 +374,7 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
             a = scfind.SCFind(); a.loadObject(p1)
             b = scfind.SCFind(); b.loadObject(p2)
         except Exception:
+            # best-effort cleanup of partially constructed objects
             try:
                 if a and hasattr(a, "close"): a.close()
             except Exception:
@@ -296,17 +388,19 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
         rss_after = rss_mb()
         holder = IndexHolder(a, b, canonical_key, index_version, load_uid)
         app.logger.info(
-            f"[Cache] Loaded {index_version} (ckey={canonical_key}) "
+            f"[Cache] Loaded {index_version} (ckey={canonical_key} uid={load_uid}) "
             f"rss_before={rss_before:.2f}MB rss_after={rss_after:.2f}MB "
             f"delta={rss_after - rss_before:.2f}MB"
         )
 
+        # insert with eviction if needed (dispose the *victim*, not the new holder)
         with scfind_cache_lock:
             def evict_one():
+                # pick any not-in-use entry to evict
                 for victim_k in list(scfind_cache.keys()):
                     if active_uses.get(victim_k, 0) == 0:
                         victim = scfind_cache.pop(victim_k, None)
-                        cache_meta.pop(victim_k, None)
+                        meta = cache_meta.pop(victim_k, None)
                         if victim:
                             before = rss_mb()
                             _dispose(victim)
@@ -340,7 +434,6 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
 def handle_memory_error(e):
     return jsonify({"error": str(e)}), 503
 
-
 @app.route('/api/cacheStatus', methods=['GET'])
 def cache_status():
     with scfind_cache_lock:
@@ -352,14 +445,12 @@ def cache_status():
             "memory_mb": rss_mb(),
         })
 
-
 @app.route('/api/diag/mem', methods=['GET'])
 def diag_mem():
     before = rss_mb()
     gc.collect(); malloc_trim()
     after = rss_mb()
     return jsonify({"ok": True, "rss_mb_before": round(before, 2), "rss_mb_after": round(after, 2)})
-
 
 @app.route('/api/memoryDetail', methods=['GET'])
 def memory_detail():
@@ -394,7 +485,6 @@ def memory_detail():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/api/unloadIndex', methods=['POST'])
 def unload_index():
@@ -433,7 +523,7 @@ def unload_index():
         "rss_mb_after": round(after, 2),
         "deleted_files": deleted,
     })
-
+    
 def wrap_with_use_dataset(route_func):
     def wrapper(*args, **kwargs):
         iv = resolve_index_version()
@@ -441,7 +531,6 @@ def wrap_with_use_dataset(route_func):
             return route_func(*args, **kwargs)
     wrapper.__name__ = route_func.__name__
     return wrapper
-
 
 @app.route('/api/findDatasetForCellType', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -452,9 +541,10 @@ def find_dataset_for_cell_type_api():
     cell_type = request.get_json().get('cell_type') if request.method == 'POST' else request.args.get('cell_type')
     if not cell_type:
         return jsonify({"error": "Missing 'cell_type'"}), 400
-    datasets = a.find_dataset_for_cell_type(cell_type)
-    return jsonify({"datasets": datasets})
 
+    datasets, cell_counts = a.find_dataset_for_cell_type(cell_type)
+    cell_counts = [int(x) for x in cell_counts]
+    return jsonify({"datasets": datasets, "counts": cell_counts})
 
 @app.route('/api/cellTypeNames', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -462,7 +552,6 @@ def get_cellTypeNames():
     index_version = g.resolved_index_version
     a, _ = get_scfind(index_version)
     return jsonify({"cellTypeNames": a.cellTypeNames()})
-
 
 @app.route('/api/marker_genes', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -481,7 +570,6 @@ def get_marker_genes():
     if hasattr(res, "to_dict"):
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
-
 
 @app.route('/api/cellTypeMarkers', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -518,7 +606,6 @@ def get_cellTypeMarkers():
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
 
-
 @app.route('/api/evaluateMarkers', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_evaluateMarkers():
@@ -547,7 +634,6 @@ def get_evaluateMarkers():
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
 
-
 @app.route('/api/hyperQueryCellTypes', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_hyperQueryCellTypes():
@@ -571,7 +657,6 @@ def get_hyperQueryCellTypes():
     if hasattr(res, "to_dict"):
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
-
 
 @app.route('/api/findCellTypeSpecificities', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -601,7 +686,6 @@ def findCellTypeSpecificities():
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
 
-
 @app.route('/api/findTissueSpecificities', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def findTissueSpecificities():
@@ -616,14 +700,12 @@ def findTissueSpecificities():
         data = request.get_json()
         gene_list = data.get('gene_list')
         min_cells = data.get('min_cells', 10)
-
-    res = a.findCellTypeSpecificities(gene_list=gene_list, min_cells=min_cells)
+    res = a.findTissueSpecificities(gene_list=gene_list, min_cells=min_cells)
     if isinstance(res, dict):
         return jsonify({"findGeneSignatures": res})
     if hasattr(res, "to_dict"):
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
-
 
 @app.route('/api/findHouseKeepingGenes', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -652,7 +734,6 @@ def findHouseKeepingGenes():
         return jsonify({"findGeneSignatures": {"message": res}})
     return jsonify({"error": f"Unexpected data type: {type(res)}"}), 400
 
-
 @app.route('/api/findGeneSignatures', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_findGeneSignatures():
@@ -671,14 +752,12 @@ def get_findGeneSignatures():
         min_cells = data.get('min_cells', 10)
         max_genes = data.get('max_genes', 1000)
         max_pval = data.get('max_pval', 0)
-
-    res = a.findGeneSignatures(cell_types, min_cells, max_genes, min_cells, max_pval)
+    res = a.findGeneSignatures(cell_types, min_cells, max_genes, max_pval)
     if isinstance(res, dict):
         return jsonify({"findGeneSignatures": res})
     if hasattr(res, "to_dict"):
         return jsonify({"findGeneSignatures": res.to_dict(orient='records')})
     return jsonify({"error": "Unexpected data type"}), 400
-
 
 @app.route('/api/cellTypeCountForTissue', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -693,7 +772,6 @@ def get_cellTypeCountForTissue():
     result_df = a.cellTypeCountForTissue(tissue).reset_index()
     return jsonify({"cellTypeCounts": result_df.to_dict(orient='records')})
 
-
 @app.route('/api/CLID2CellType', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_CLID2CellType():
@@ -705,7 +783,6 @@ def get_CLID2CellType():
         return jsonify({"error": "Missing 'CLID_label'"}), 400
     result = a.CLID2CellType(clid_label)
     return jsonify({"cell_types": list(result)})
-
 
 @app.route('/api/CellType2CLID', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -719,7 +796,6 @@ def get_CellType2CLID():
     result = a.CellType2CLID(cell_type)
     return jsonify({"CLIDs": list(result)})
 
-
 @app.route('/api/getDatasets', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_datasets():
@@ -727,14 +803,12 @@ def get_datasets():
     a, _ = get_scfind(index_version)
     return jsonify({"datasets": a.getDatasets()})
 
-
 @app.route('/api/scfindGenes', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_scfind_genes():
     index_version = g.resolved_index_version
     a, _ = get_scfind(index_version)
     return jsonify({"genes": a.scfindGenes})
-
 
 @app.route('/api/clidMappingAll', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -744,7 +818,6 @@ def get_clid_mapping_all():
     clid_mapping_raw = a.getCLIDmappingAll()
     clid_mapping = {k: list(v) for k, v in clid_mapping_raw.items()}
     return jsonify({"clidMappingAll": clid_mapping})
-
 
 @app.route('/api/findDatasets', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -771,9 +844,13 @@ def get_findDatasets():
     if isinstance(datasets, str):
         datasets = [d.strip() for d in datasets.split(',')]
 
-    res = b.findDatasets(gene_list=gene_list, min_cells=min_cells, datasets=datasets)
-    return jsonify({"findDatasets": res})
-
+    datasets_by_gene, counts_by_gene = b.findDatasets(
+        gene_list=gene_list, min_cells=min_cells, datasets=datasets
+    )
+    return jsonify({
+        "findDatasets": datasets_by_gene,  
+        "counts": counts_by_gene          
+    })
 
 @app.route('/api/getCellTypeExpression', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -807,7 +884,6 @@ def get_cell_type_expression():
     }
     return jsonify({"expression_matrix": expression_matrix, "var_names": adata.var_names.tolist()})
 
-
 @app.route('/api/getCellTypeExpressionBinData', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_cell_type_expression_bin_data():
@@ -833,7 +909,6 @@ def get_cell_type_expression_bin_data():
     res = b.getCellTypeExpressionBinData(cell_type, gene_list, bin_length)
     return jsonify(res)
 
-
 @app.route('/api/cellTypeCountForDataset', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def get_cellTypeCountForDataset():
@@ -847,7 +922,6 @@ def get_cellTypeCountForDataset():
     result_df = a.cellTypeCountforDataset(dataset).reset_index()
     return jsonify({"cellTypeCounts": result_df.to_dict(orient='records')})
 
-
 @app.route('/api/total_cells', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def total_cells():
@@ -855,14 +929,12 @@ def total_cells():
     a, _ = get_scfind(index_version)
     return jsonify({"total_cells": a.getTotalCells()})
 
-
 @app.route('/api/total_cell_types', methods=['GET', 'POST'])
 @wrap_with_use_dataset
 def total_cell_types():
     index_version = g.resolved_index_version
     a, _ = get_scfind(index_version)
     return jsonify({"total_cell_types": a.getTotalCellTypes()})
-
 
 @app.route('/api/listAllIndexVersions', methods=['GET'])
 def list_all_index_versions():
@@ -891,7 +963,6 @@ def list_all_index_versions():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/getAllIndexVersionsConfig', methods=['GET'])
 def get_all_index_versions_config():
     try:
@@ -899,12 +970,10 @@ def get_all_index_versions_config():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/testCache', methods=['GET'])
 def test_cache():
     with scfind_cache_lock:
         return jsonify({"cached_versions": list(scfind_cache.keys())})
-
 
 @app.route('/memoryStatus', methods=['GET'])
 def memory_status():
@@ -917,11 +986,10 @@ def memory_status():
     app.logger.info(f"[MEMORY STATUS] {memory_stats}")
     return jsonify(memory_stats)
 
-
 @app.route('/health', methods=['GET'])
 def health():
     return 'ok'
-    
+
 if __name__ == '__main__':
     debug_mode = os.environ.get("DEBUG", "False").lower() == "true"
     port = int(os.environ.get("PORT", 8080))
