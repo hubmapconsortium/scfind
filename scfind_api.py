@@ -741,7 +741,7 @@ def get_CellType2CLID():
 @wrap_with_use_dataset
 def get_datasets():
     index_version = g.resolved_index_version
-    a, _ = get_scfind(index_version)
+    _, b = get_scfind(index_version)
 
     datasets, counts = b.getDatasets()
 
