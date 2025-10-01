@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -22,7 +23,9 @@ from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from filelock import FileLock
 from logging.handlers import RotatingFileHandler
+
 import scfind
+
 from logging import Formatter, StreamHandler, getLogger
 try:
     # Safe across gunicorn workers (processes/threads)
@@ -73,109 +76,15 @@ CORS(app, resources={r"/api/*": {"origins": [
 ]}}, supports_credentials=True)
 
 S3_BUCKET_NAME = os.environ.get('SCFIND_S3_BUCKET', 'scfind-dataset')
-DATA_ROOT = os.environ.get('SCFIND_DATA_ROOT', '/data/scfind')
+DATA_ROOT = os.environ.get('SCFIND_DATA_ROOT', '/data/scfind') 
 CACHE_MAXSIZE = int(os.environ.get('SCFIND_CACHE_MAXSIZE', '2'))
 CACHE_TTL = int(os.environ.get('SCFIND_CACHE_TTL_SECONDS', '36000'))  # 0 => no TTL
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
-# metadata keyed by friendly index_version
-cache_meta: Dict[str, Dict[str, Any]] = {}
-
-# cache: index_version -> IndexHolder
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def rss_mb() -> float:
-    return psutil.Process(os.getpid()).memory_info().rss / 1e6
-
-def malloc_trim() -> None:
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-
-# Dispose helper for evictions
-def _dispose(holder: Optional["IndexHolder"]) -> None:
-    if not holder:
-        return
-    try:
-        holder.close()
-    except Exception:
-        pass
-    # Drop strong refs
-    del holder
-    gc.collect()
-    malloc_trim()
-
-def _on_cache_evict(key, holder):
-    """Called by TTLCache on TTL/LRU eviction."""
-    try:
-        before = rss_mb()
-        _dispose(holder)
-        after = rss_mb()
-        app.logger.info(
-            f"[CacheEvict] key={key} rss_before={before:.2f}MB rss_after={after:.2f}MB delta={after-before:.2f}MB"
-        )
-    except Exception as e:
-        app.logger.warning(f"[CacheEvict] dispose failed for {key}: {e}")
-
-# -------- Disposal helpers --------
-def _dispose(holder: Optional["IndexHolder"]) -> None:
-    if not holder:
-        return
-    try:
-        holder.close()
-    except Exception:
-        pass
-    del holder
-    gc.collect()
-    malloc_trim()
-
-def _on_cache_evict(key, holder):
-    """Called whenever an entry is evicted or expired and removed."""
-    try:
-        before = rss_mb()
-        _dispose(holder)
-        after = rss_mb()
-        app.logger.info(
-            f"[CacheEvict] key={key} rss_before={before:.2f}MB rss_after={after:.2f}MB delta={after-before:.2f}MB"
-        )
-    except Exception as e:
-        app.logger.warning(f"[CacheEvict] dispose failed for {key}: {e}")
-
-# -------- TTLCache with disposal hook --------
-from cachetools import TTLCache
-
-class TTLCacheWithDispose(TTLCache):
-    def __delitem__(self, key):
-        try:
-            # If present and not already expired, fetch for disposal.
-            # Accessing via dict avoids triggering another expiry path.
-            val = self._Cache__data.get(key, None)  # type: ignore[attr-defined]
-            if val is not None:
-                _on_cache_evict(key, val)
-        except Exception:
-            # Best effort; never block deletion
-            pass
-        super().__delitem__(key)
-
-    def popitem(self):
-        # Called by internal eviction to remove one item; dispose it.
-        k, v = super().popitem()
-        try:
-            _on_cache_evict(k, v)
-        except Exception:
-            pass
-        return (k, v)
-
-
 # cache: index_version -> IndexHolder
 if CACHE_TTL > 0:
-    scfind_cache: TTLCacheWithDispose[str, "IndexHolder"] = TTLCacheWithDispose(
-        maxsize=CACHE_MAXSIZE,
-        ttl=CACHE_TTL,
-    )
+    scfind_cache: TTLCache[str, "IndexHolder"] = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL)
 else:
     scfind_cache: Dict[str, "IndexHolder"] = {}
 
@@ -183,7 +92,25 @@ scfind_cache_lock = Lock()               # protects scfind_cache / cache_meta
 loading_locks: Dict[str, Lock] = defaultdict(Lock)  # per canonical_key
 active_uses: Dict[str, int] = defaultdict(int)
 
+# metadata keyed by friendly index_version
+cache_meta: Dict[str, Dict[str, Any]] = {}
+
 _SENSITIVE_KEYS = {"authorization", "api_key", "x-api-key", "password", "secret", "token"}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def rss_mb() -> float:
+    return psutil.Process(os.getpid()).memory_info().rss / 1e6
+
+
+def malloc_trim() -> None:
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 def _clip_str(s: str, limit=2000):
     return s if len(s) <= limit else s[:limit] + "...<clipped>"
@@ -199,6 +126,7 @@ def safe_json(val, limit=2000):
         return _clip_str(str(val), limit)
     except Exception:
         return "<unserializable>"
+
 
 def _mask_sensitive(d: dict):
     if not isinstance(d, dict):
@@ -220,6 +148,7 @@ def _access_log_request():
         args.update(body)
     params = _mask_sensitive(safe_json(args))
 
+    # summarize a few
     watch_keys = {"index_version", "gene_list", "cell_types", "datasets", "dataset", "cell_type"}
     extras = {k: params.get(k) for k in watch_keys if isinstance(params, dict) and k in params}
 
@@ -323,7 +252,19 @@ class IndexHolder:
                     obj.close()
                 except Exception:
                     pass
-                    
+
+def _dispose(holder: Optional[IndexHolder]) -> None:
+    if not holder:
+        return
+    try:
+        holder.close()
+    except Exception:
+        pass
+    # Drop strong refs
+    del holder
+    gc.collect()
+    malloc_trim()
+
 def resolve_index_version() -> str:
     iv = request.args.get('index_version')
     if not iv:
@@ -350,17 +291,13 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
     with scfind_cache_lock:
         holder = scfind_cache.get(index_version)
         if holder:
-            app.logger.info(f"[CacheHit] {index_version} (ckey={holder.canonical_key}) rss={rss_mb():.2f}MB")
             return holder.a, holder.b
-
-    app.logger.info(f"[CacheMiss] {index_version} (ckey={canonical_key}) entering load gate")
 
     # serialize loads per canonical resource
     with loading_locks[canonical_key]:
         with scfind_cache_lock:
             holder = scfind_cache.get(index_version)
             if holder:
-                app.logger.info(f"[CacheHitAfterWait] {index_version} (ckey={holder.canonical_key}) rss={rss_mb():.2f}MB")
                 return holder.a, holder.b
 
         # ensure files exist on disk
@@ -388,7 +325,7 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
         rss_after = rss_mb()
         holder = IndexHolder(a, b, canonical_key, index_version, load_uid)
         app.logger.info(
-            f"[Cache] Loaded {index_version} (ckey={canonical_key} uid={load_uid}) "
+            f"[Cache] Loaded {index_version} (ckey={canonical_key}) "
             f"rss_before={rss_before:.2f}MB rss_after={rss_after:.2f}MB "
             f"delta={rss_after - rss_before:.2f}MB"
         )
@@ -400,7 +337,7 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
                 for victim_k in list(scfind_cache.keys()):
                     if active_uses.get(victim_k, 0) == 0:
                         victim = scfind_cache.pop(victim_k, None)
-                        meta = cache_meta.pop(victim_k, None)
+                        cache_meta.pop(victim_k, None)
                         if victim:
                             before = rss_mb()
                             _dispose(victim)
@@ -416,9 +353,11 @@ def get_scfind(index_version: Optional[str] = None) -> Tuple[scfind.SCFind, scfi
                         return True
                 return False
 
+            # respect capacity for both TTLCache and dict
             maxsize = scfind_cache.maxsize if isinstance(scfind_cache, TTLCache) else CACHE_MAXSIZE
             while len(scfind_cache) >= maxsize:
                 if not evict_one():
+                    # nothing eligible to evict; proceed (rare, but avoid deadlock)
                     break
 
             scfind_cache[index_version] = holder
@@ -523,7 +462,7 @@ def unload_index():
         "rss_mb_after": round(after, 2),
         "deleted_files": deleted,
     })
-    
+
 def wrap_with_use_dataset(route_func):
     def wrapper(*args, **kwargs):
         iv = resolve_index_version()
@@ -700,7 +639,8 @@ def findTissueSpecificities():
         data = request.get_json()
         gene_list = data.get('gene_list')
         min_cells = data.get('min_cells', 10)
-    res = a.findTissueSpecificities(gene_list=gene_list, min_cells=min_cells)
+
+    res = a.findCellTypeSpecificities(gene_list=gene_list, min_cells=min_cells)
     if isinstance(res, dict):
         return jsonify({"findGeneSignatures": res})
     if hasattr(res, "to_dict"):
@@ -752,7 +692,8 @@ def get_findGeneSignatures():
         min_cells = data.get('min_cells', 10)
         max_genes = data.get('max_genes', 1000)
         max_pval = data.get('max_pval', 0)
-    res = a.findGeneSignatures(cell_types, min_cells, max_genes, max_pval)
+
+    res = a.findGeneSignatures(cell_types, min_cells, max_genes, min_cells, max_pval)
     if isinstance(res, dict):
         return jsonify({"findGeneSignatures": res})
     if hasattr(res, "to_dict"):
@@ -801,7 +742,16 @@ def get_CellType2CLID():
 def get_datasets():
     index_version = g.resolved_index_version
     a, _ = get_scfind(index_version)
-    return jsonify({"datasets": a.getDatasets()})
+
+    datasets, counts = b.getDatasets()
+
+    # Ensure JSON-serializable ints
+    counts = [int(c) for c in counts]
+
+    return jsonify({
+        "datasets": datasets,
+        "counts": counts
+    })
 
 @app.route('/api/scfindGenes', methods=['GET', 'POST'])
 @wrap_with_use_dataset
@@ -974,7 +924,7 @@ def get_all_index_versions_config():
 def test_cache():
     with scfind_cache_lock:
         return jsonify({"cached_versions": list(scfind_cache.keys())})
-
+        
 @app.route('/memoryStatus', methods=['GET'])
 def memory_status():
     memory_stats = {
@@ -985,6 +935,7 @@ def memory_status():
     }
     app.logger.info(f"[MEMORY STATUS] {memory_stats}")
     return jsonify(memory_stats)
+
 
 @app.route('/health', methods=['GET'])
 def health():
