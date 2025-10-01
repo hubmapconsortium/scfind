@@ -743,7 +743,7 @@ def get_datasets():
     index_version = g.resolved_index_version
     a, _ = get_scfind(index_version)
 
-    datasets, counts = a.getDatasets()
+    datasets, counts = b.getDatasets()
 
     # Ensure JSON-serializable ints
     counts = [int(c) for c in counts]
